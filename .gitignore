@@ -1,0 +1,17 @@
+# 环境变量和密钥
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Node.js
+node_modules/
+dist/
+
+# 本地数据库
+*.db
+*.sqlite3
