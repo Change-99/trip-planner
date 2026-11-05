@@ -7,7 +7,7 @@ from datetime import date
 
 # ============ 请求模型 ============
 
- class TripRequest(BaseModel):
+class TripRequest(BaseModel):
     """旅行规划请求"""
     city: str = Field(..., description="目的地城市", example="北京")
     start_date: str = Field(..., description="开始日期 YYYY-MM-DD", example="2025-06-01")
@@ -31,7 +31,6 @@ from datetime import date
                 "free_text_input": "希望多安排一些博物馆"
             }
         }
-
 
 class POISearchRequest(BaseModel):
     """POI搜索请求"""
