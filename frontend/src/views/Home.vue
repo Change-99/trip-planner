@@ -106,7 +106,6 @@
                   <a-select-option value="公共交通">🚇 公共交通</a-select-option>
                   <a-select-option value="自驾">🚗 自驾</a-select-option>
                   <a-select-option value="步行">🚶 步行</a-select-option>
-                  <a-select-option value="混合">🔀 混合</a-select-option>
                 </a-select>
               </a-form-item>
             </a-col>
@@ -143,7 +142,33 @@
           </a-row>
         </div>
 
-        <!-- 第三步:额外要求 -->
+        <!-- 第三步:人数与预算 -->
+        <div class="form-section">
+          <div class="section-header">
+            <span class="section-icon">💰</span>
+            <span class="section-title">人数与预算</span>
+          </div>
+
+          <a-row :gutter="24">
+            <a-col :span="8">
+              <a-form-item name="traveler_count" label="出行人数">
+                <a-input-number v-model:value="formData.traveler_count" :min="1" :max="30" size="large" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="8">
+              <a-form-item name="room_count" label="房间数">
+                <a-input-number v-model:value="formData.room_count" :min="1" :max="10" size="large" style="width: 100%" />
+              </a-form-item>
+            </a-col>
+            <a-col :span="8">
+              <a-form-item name="budget_limit" label="总预算上限（元，可选）">
+                <a-input-number v-model:value="formData.budget_limit" :min="0" :precision="0" size="large" style="width: 100%" placeholder="未填写则不限制" />
+              </a-form-item>
+            </a-col>
+          </a-row>
+        </div>
+
+        <!-- 第四步:额外要求 -->
         <div class="form-section">
           <div class="section-header">
             <span class="section-icon">💬</span>
@@ -207,7 +232,7 @@
 import { ref, reactive, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
-import { generateTripPlan } from '@/services/api'
+import { startTripPlanJob, waitForTripJob } from '@/services/api'
 import type { TripFormData } from '@/types'
 import type { Dayjs } from 'dayjs'
 
@@ -229,7 +254,10 @@ const formData = reactive<TripFormState>({
   transportation: '公共交通',
   accommodation: '经济型酒店',
   preferences: [],
-  free_text_input: ''
+  free_text_input: '',
+  budget_limit: undefined,
+  traveler_count: 1,
+  room_count: 1
 })
 
 // 监听日期变化,自动计算旅行天数
@@ -256,25 +284,7 @@ const handleSubmit = async () => {
 
   loading.value = true
   loadingProgress.value = 0
-  loadingStatus.value = '正在初始化...'
-
-  // 模拟进度更新
-  const progressInterval = setInterval(() => {
-    if (loadingProgress.value < 90) {
-      loadingProgress.value += 10
-
-      // 更新状态文本
-      if (loadingProgress.value <= 30) {
-        loadingStatus.value = '🔍 正在搜索景点...'
-      } else if (loadingProgress.value <= 50) {
-        loadingStatus.value = '🌤️ 正在查询天气...'
-      } else if (loadingProgress.value <= 70) {
-        loadingStatus.value = '🏨 正在推荐酒店...'
-      } else {
-        loadingStatus.value = '📋 正在生成行程计划...'
-      }
-    }
-  }, 500)
+  loadingStatus.value = '正在提交规划任务...'
 
   try {
     const requestData: TripFormData = {
@@ -285,37 +295,32 @@ const handleSubmit = async () => {
       transportation: formData.transportation,
       accommodation: formData.accommodation,
       preferences: formData.preferences,
-      free_text_input: formData.free_text_input
+      free_text_input: formData.free_text_input,
+      budget_limit: formData.budget_limit,
+      traveler_count: formData.traveler_count,
+      room_count: formData.room_count
     }
 
-    const response = await generateTripPlan(requestData)
+    const job = await startTripPlanJob(requestData)
+    loadingProgress.value = job.progress
+    loadingStatus.value = job.stage
 
-    clearInterval(progressInterval)
-    loadingProgress.value = 100
-    loadingStatus.value = '✅ 完成!'
-
-    if (response.success && response.data) {
-      // 保存到sessionStorage
-      sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
-
-      message.success('旅行计划生成成功!')
-
-      // 短暂延迟后跳转
-      setTimeout(() => {
-        router.push('/result')
-      }, 500)
-    } else {
-      message.error(response.message || '生成失败')
+    const completed = await waitForTripJob(job.job_id, status => {
+      loadingProgress.value = status.progress
+      loadingStatus.value = status.stage
+    })
+    if (!completed.plan_id) {
+      throw new Error('规划已完成，但后端没有返回 plan_id')
     }
+
+    message.success('旅行计划已生成并保存')
+    await router.push(`/result/${completed.plan_id}`)
   } catch (error: any) {
-    clearInterval(progressInterval)
     message.error(error.message || '生成旅行计划失败,请稍后重试')
   } finally {
-    setTimeout(() => {
-      loading.value = false
-      loadingProgress.value = 0
-      loadingStatus.value = ''
-    }, 1000)
+    loading.value = false
+    loadingProgress.value = 0
+    loadingStatus.value = ''
   }
 }
 </script>
@@ -651,4 +656,3 @@ const handleSubmit = async () => {
   }
 }
 </style>
-

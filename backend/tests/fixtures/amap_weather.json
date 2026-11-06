@@ -1,0 +1,20 @@
+{
+  "status": "1",
+  "info": "OK",
+  "forecasts": [
+    {
+      "city": "上海市",
+      "casts": [
+        {
+          "date": "2026-11-10",
+          "dayweather": "晴",
+          "nightweather": "多云",
+          "daytemp": "22",
+          "nighttemp": "15",
+          "daywind": "东",
+          "daypower": "1-3"
+        }
+      ]
+    }
+  ]
+}

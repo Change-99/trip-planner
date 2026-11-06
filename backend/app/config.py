@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 from typing import List
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -20,8 +21,8 @@ class Settings(BaseSettings):
     """应用配置"""
 
     # 应用基本配置
-    app_name: str = "HelloAgents智能旅行助手"
-    app_version: str = "1.0.0"
+    app_name: str = "LangGraph智能旅行规划系统"
+    app_version: str = "2.0.0"
     debug: bool = False
 
     # 服务器配置
@@ -33,6 +34,18 @@ class Settings(BaseSettings):
 
     # 高德地图API配置
     amap_api_key: str = ""
+    # amap-mcp-server 当前使用 uvx 独立环境，与部分 Pydantic
+    # 版本组合不兼容。默认使用同一数据源的高德官方 REST API，
+    # 只有在独立验证 MCP 环境后才显式开启。
+    amap_mcp_enabled: bool = False
+    amap_max_qps: float = 1.0
+    amap_max_retries: int = 1
+    planning_timeout_seconds: float = 105.0
+
+    # 价格研究 MCP 配置。只有白名单域名可以产出“已核实”精确票价；
+    # 其他来源即使包含数字，也只能作为估算区间。
+    tavily_api_key: str = ""
+    price_trusted_domains: str = ""
 
     # Unsplash API配置
     unsplash_access_key: str = ""
@@ -46,6 +59,19 @@ class Settings(BaseSettings):
     # 日志配置
     log_level: str = "INFO"
 
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug_mode(cls, value):
+        """兼容部署脚本常用的 release/production 等环境名称。"""
+
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"release", "production", "prod"}:
+                return False
+            if normalized in {"development", "dev", "debug"}:
+                return True
+        return value
+
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -54,6 +80,15 @@ class Settings(BaseSettings):
     def get_cors_origins_list(self) -> List[str]:
         """获取CORS origins列表"""
         return [origin.strip() for origin in self.cors_origins.split(',')]
+
+    def price_trusted_domains_list(self) -> List[str]:
+        """返回经过人工确认的官方价格来源域名。"""
+
+        return [
+            domain.strip().lower().lstrip(".")
+            for domain in self.price_trusted_domains.split(",")
+            if domain.strip()
+        ]
 
 
 # 创建全局配置实例
@@ -78,6 +113,8 @@ def validate_config():
     llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not llm_api_key:
         warnings.append("LLM_API_KEY或OPENAI_API_KEY未配置,LLM功能可能无法使用")
+    if not settings.tavily_api_key:
+        warnings.append("TAVILY_API_KEY未配置,价格MCP将使用限额更低的keyless模式")
 
     if errors:
         error_msg = "配置错误:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -108,4 +145,3 @@ def print_config():
     print(f"LLM Base URL: {llm_base_url}")
     print(f"LLM Model: {llm_model}")
     print(f"日志级别: {settings.log_level}")
-

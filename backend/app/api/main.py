@@ -12,7 +12,7 @@ settings = get_settings()
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    description="基于HelloAgents框架的智能旅行规划助手API",
+    description="基于 LangGraph、真实数据证据和 OR-Tools 约束求解的旅行规划 API",
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -96,4 +96,3 @@ if __name__ == "__main__":
         port=settings.port,
         reload=True
     )
-

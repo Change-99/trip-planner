@@ -1,241 +1,245 @@
-"""LangGraph 旅行规划工作流的单元测试，仅使用模拟服务。"""
+"""双层 LangGraph 工作流的离线端到端测试。"""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
-from typing import Any
 
 import pytest
 
 from app.graph.builder import build_trip_graph
-from app.graph.nodes import TripDataSourceError, TripPlanValidationError
-from app.models.schemas import TripPlan, TripRequest
+from app.graph.nodes import TripRequestValidationError, WorkflowDependencies
+from app.models.planning import (
+    EvidenceSource,
+    EvidenceStatus,
+    OpeningHoursEvidence,
+    POIEvidence,
+    PriceCategory,
+    PriceEvidence,
+    PriceQuoteEvidence,
+    PriceStatus,
+    RouteEvidence,
+    TaskResult,
+    TaskSpec,
+    TaskType,
+    TimeWindow,
+    TravelMode,
+    VerificationStatus,
+    WeatherEvidence,
+)
+from app.models.schemas import Location, TripPlan, TripRequest, WeatherInfo
+from app.planning.optimizer import ItineraryOptimizer
+from app.planning.scorer import HeuristicInterestScorer
 
 
-def make_request() -> TripRequest:
-    return TripRequest(
-        city="上海",
-        start_date="2026-11-10",
-        end_date="2026-11-12",
-        travel_days=3,
-        transportation="公共交通",
-        accommodation="舒适型酒店",
-        preferences=["历史文化", "城市风光"],
-        free_text_input="节奏不要太赶",
-    )
-
-
-def make_valid_draft(request: TripRequest) -> dict[str, Any]:
-    start = date.fromisoformat(request.start_date)
-    days = []
-    weather_info = []
-    for offset in range(request.travel_days):
-        current_date = (start + timedelta(days=offset)).isoformat()
-        days.append(
-            {
-                "day_index": offset,
-                "date": current_date,
-                "description": "测试日程",
-                "transportation": request.transportation,
-                "accommodation": request.accommodation,
-                "hotel": None,
-                "attractions": [
-                    {
-                        "name": f"测试景点{offset + 1}",
-                        "address": "上海市测试路1号",
-                        "location": {"longitude": 121.47, "latitude": 31.23},
-                        "visit_duration": 120,
-                        "description": "用于单元测试",
-                    }
-                ],
-                "meals": [],
-            }
-        )
-        weather_info.append(
-            {
-                "date": current_date,
-                "day_weather": "晴",
-                "night_weather": "多云",
-                "day_temp": 22,
-                "night_temp": 15,
-                "wind_direction": "东风",
-                "wind_power": "1-3级",
-            }
-        )
-    return {
-        "city": request.city,
-        "start_date": request.start_date,
-        "end_date": request.end_date,
-        "days": days,
-        "weather_info": weather_info,
-        "overall_suggestions": "单元测试建议",
-        "budget": None,
+def make_request(**updates) -> TripRequest:
+    data = {
+        "city": "上海",
+        "start_date": "2026-11-10",
+        "end_date": "2026-11-10",
+        "travel_days": 1,
+        "transportation": "公共交通",
+        "accommodation": "舒适型酒店",
+        "preferences": ["历史文化"],
+        "free_text_input": "节奏不要太赶",
     }
+    data.update(updates)
+    return TripRequest(**data)
 
 
-class FakeServices:
-    def __init__(self) -> None:
-        self.active_queries = 0
-        self.max_active_queries = 0
-        self.planner_calls = 0
-        self.planner_inputs: dict[str, str] | None = None
-
-    async def _query(self, result: str) -> str:
-        self.active_queries += 1
-        self.max_active_queries = max(self.max_active_queries, self.active_queries)
-        await asyncio.sleep(0.03)
-        self.active_queries -= 1
-        return result
-
-    async def search_attractions(self, request: TripRequest) -> str:
-        return await self._query("景点上下文")
-
-    async def get_weather(self, request: TripRequest) -> str:
-        return await self._query("天气上下文")
-
-    async def search_hotels(self, request: TripRequest) -> str:
-        return await self._query("酒店上下文")
-
-    async def generate_plan(
-        self,
-        request: TripRequest,
-        attraction_context: str,
-        weather_context: str,
-        hotel_context: str,
-    ) -> dict[str, Any]:
-        self.planner_calls += 1
-        self.planner_inputs = {
-            "attractions": attraction_context,
-            "weather": weather_context,
-            "hotels": hotel_context,
-        }
-        return make_valid_draft(request)
-
-
-def invoke_graph(services: FakeServices) -> dict[str, Any]:
-    graph = build_trip_graph(services)
-    return asyncio.run(
-        graph.ainvoke(
-            {"request": make_request(), "retry_count": 0, "warnings": []}
-        )
+def make_poi(
+    poi_id: str,
+    name: str,
+    longitude: float,
+    *,
+    category: str = "历史文化",
+) -> POIEvidence:
+    return POIEvidence(
+        poi_id=poi_id,
+        name=name,
+        address=f"上海市{name}路1号",
+        location=Location(longitude=longitude, latitude=31.23),
+        categories=[category],
+        rating=4.7,
+        opening_hours=OpeningHoursEvidence(
+            status=VerificationStatus.VERIFIED,
+            weekly_windows={
+                weekday: [TimeWindow(start="09:00", end="20:00")]
+                for weekday in range(7)
+            },
+        ),
+        ticket_price=PriceEvidence(),
+        source=EvidenceSource(provider="fixture", method="poi_search"),
     )
 
 
-def test_graph_compiles_parallelizes_and_joins_all_contexts() -> None:
-    services = FakeServices()
+class FakeExecutor:
+    """模拟真实工具，但仍返回 Executor 约定的结构化证据。"""
 
-    result = invoke_graph(services)
+    def __init__(self, *, fail_all: bool = False) -> None:
+        self.fail_all = fail_all
+        self.active = 0
+        self.max_active = 0
+        self.executed_types: list[TaskType] = []
+        self.pois = [
+            make_poi("p1", "上海历史博物馆", 121.470),
+            make_poi("p2", "城市历史展览馆", 121.475),
+        ]
+
+    async def execute(self, task: TaskSpec) -> TaskResult:
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self.executed_types.append(task.task_type)
+        await asyncio.sleep(0.01)
+        self.active -= 1
+        source = EvidenceSource(provider="fixture", method=task.task_type.value)
+        if self.fail_all:
+            return TaskResult(
+                task_id=task.task_id,
+                task_type=task.task_type,
+                status=EvidenceStatus.FAILED,
+                evidence_type=task.task_type.value,
+                source=source,
+                error="fixture unavailable",
+            )
+        if task.task_type == TaskType.SEARCH_POI:
+            data = [poi.model_dump(mode="json") for poi in self.pois]
+            return self._result(task, "pois", data)
+        if task.task_type == TaskType.SEARCH_HOTEL:
+            hotel = make_poi("h1", "测试酒店", 121.472, category="酒店")
+            return self._result(task, "hotels", [hotel.model_dump(mode="json")])
+        if task.task_type == TaskType.QUERY_WEATHER:
+            weather = WeatherEvidence(
+                city="上海",
+                forecasts=[WeatherInfo(date="2026-11-10", day_weather="晴")],
+                status=EvidenceStatus.SUCCESS,
+                source=source,
+            )
+            return self._result(task, "weather", weather.model_dump(mode="json"))
+        if task.task_type == TaskType.QUERY_ROUTE:
+            arguments = task.arguments
+            route = RouteEvidence(
+                origin_id=arguments["origin_id"],
+                destination_id=arguments["destination_id"],
+                mode=TravelMode(arguments["mode"]),
+                distance_meters=800,
+                duration_seconds=10 * 60,
+                source=source,
+            )
+            return self._result(task, "routes", route.model_dump(mode="json"))
+        if task.task_type in {
+            TaskType.QUERY_TICKET_PRICE,
+            TaskType.QUERY_HOTEL_PRICE,
+            TaskType.QUERY_MEAL_PRICE,
+        }:
+            category = {
+                TaskType.QUERY_TICKET_PRICE: PriceCategory.TICKET,
+                TaskType.QUERY_HOTEL_PRICE: PriceCategory.HOTEL_NIGHT,
+                TaskType.QUERY_MEAL_PRICE: PriceCategory.MEAL_PERSON,
+            }[task.task_type]
+            if category == PriceCategory.TICKET:
+                price = PriceEvidence(
+                    status=PriceStatus.VERIFIED,
+                    amount_yuan=50,
+                    source_url="https://example.gov.cn/ticket",
+                    source=source,
+                )
+            else:
+                price = PriceEvidence(
+                    status=PriceStatus.ESTIMATED_RANGE,
+                    minimum_yuan=30 if category == PriceCategory.MEAL_PERSON else 300,
+                    maximum_yuan=50 if category == PriceCategory.MEAL_PERSON else 400,
+                    source_url="https://example.com/price",
+                    source=source,
+                )
+            quote = PriceQuoteEvidence(
+                quote_id=task.arguments["quote_id"],
+                category=category,
+                entity_id=task.arguments.get("entity_id"),
+                entity_name=task.arguments.get("entity_name", "当地餐饮"),
+                price=price,
+                source=source,
+                source_url=price.source_url,
+            )
+            return self._result(task, "price_quotes", quote.model_dump(mode="json"))
+        raise AssertionError(f"unexpected task {task.task_type}")
+
+    @staticmethod
+    def _result(task: TaskSpec, evidence_type: str, data) -> TaskResult:
+        return TaskResult(
+            task_id=task.task_id,
+            task_type=task.task_type,
+            status=EvidenceStatus.SUCCESS,
+            evidence_type=evidence_type,
+            data=data,
+            source=EvidenceSource(provider="fixture", method=task.task_type.value),
+        )
+
+
+def make_dependencies(executor: FakeExecutor) -> WorkflowDependencies:
+    return WorkflowDependencies(
+        executor=executor,
+        scorer=HeuristicInterestScorer(),
+        optimizer=ItineraryOptimizer(solver_timeout_seconds=2),
+        max_evidence_retries=2,
+        max_itinerary_retries=1,
+    )
+
+
+def invoke_graph(executor: FakeExecutor, request: TripRequest | None = None):
+    graph = build_trip_graph(make_dependencies(executor))
+    return asyncio.run(graph.ainvoke({"request": request or make_request()}))
+
+
+def test_graph_collects_real_evidence_then_generates_valid_timeline() -> None:
+    executor = FakeExecutor()
+
+    result = invoke_graph(executor)
 
     assert isinstance(result["final_plan"], TripPlan)
-    assert services.max_active_queries == 3
-    assert services.planner_calls == 1
-    assert services.planner_inputs == {
-        "attractions": "景点上下文",
-        "weather": "天气上下文",
-        "hotels": "酒店上下文",
-    }
+    assert result["planning_status"] == "feasible"
+    assert result["validation_report"].passed is True
+    assert result["evidence_retry_count"] == 1
+    assert executor.max_active >= 2
+    assert TaskType.SEARCH_POI in executor.executed_types
+    assert TaskType.QUERY_ROUTE in executor.executed_types
+    assert TaskType.QUERY_TICKET_PRICE in executor.executed_types
+    assert len(result["final_plan"].days[0].attractions) == 2
+    assert result["final_plan"].travel_advice
+    assert result["final_plan"].budget is not None
+    assert any(
+        item["type"] == "transport"
+        for item in result["final_plan"].days[0].timeline
+    )
 
 
-def test_one_compiled_graph_keeps_concurrent_request_state_isolated() -> None:
-    services = FakeServices()
-    graph = build_trip_graph(services)
-    shanghai_request = make_request()
-    beijing_request = shanghai_request.model_copy(update={"city": "北京"})
+def test_data_source_failure_returns_limitations_without_fake_plan() -> None:
+    result = invoke_graph(FakeExecutor(fail_all=True))
+
+    assert "final_plan" not in result
+    assert result["planning_status"] == "limited"
+    assert result["limitations"]
+    assert any("候选景点" in reason for reason in result["limitations"])
+
+
+def test_conflicting_must_visit_and_forbidden_place_is_rejected() -> None:
+    request = make_request(must_visit=["外滩"], forbidden_places=["外滩"])
+    graph = build_trip_graph(make_dependencies(FakeExecutor()))
+
+    with pytest.raises(TripRequestValidationError, match="既是必去又是禁止"):
+        asyncio.run(graph.ainvoke({"request": request}))
+
+
+def test_compiled_graph_keeps_concurrent_request_state_isolated() -> None:
+    executor = FakeExecutor()
+    graph = build_trip_graph(make_dependencies(executor))
 
     async def run_both():
         return await asyncio.gather(
-            graph.ainvoke(
-                {"request": shanghai_request, "retry_count": 0, "warnings": []}
-            ),
-            graph.ainvoke(
-                {"request": beijing_request, "retry_count": 0, "warnings": []}
-            ),
+            graph.ainvoke({"request": make_request()}),
+            graph.ainvoke({"request": make_request(city="北京")}),
         )
 
-    results = asyncio.run(run_both())
+    first, second = asyncio.run(run_both())
 
-    assert [result["final_plan"].city for result in results] == ["上海", "北京"]
-
-
-class OptionalFailuresServices(FakeServices):
-    async def get_weather(self, request: TripRequest) -> str:
-        raise ConnectionError("weather unavailable")
-
-    async def search_hotels(self, request: TripRequest) -> str:
-        raise TimeoutError("hotel unavailable")
-
-
-def test_optional_service_failures_degrade_without_faking_data() -> None:
-    services = OptionalFailuresServices()
-
-    result = invoke_graph(services)
-
-    assert isinstance(result["final_plan"], TripPlan)
-    assert len(result["warnings"]) == 2
-    assert "不要编造具体天气" in services.planner_inputs["weather"]
-    assert "不要编造酒店" in services.planner_inputs["hotels"]
-
-
-class AttractionFailureServices(FakeServices):
-    async def search_attractions(self, request: TripRequest) -> str:
-        raise ConnectionError("attractions unavailable")
-
-
-def test_core_attraction_failure_is_explicit() -> None:
-    graph = build_trip_graph(AttractionFailureServices())
-
-    with pytest.raises(TripDataSourceError, match="核心景点数据查询失败"):
-        asyncio.run(
-            graph.ainvoke(
-                {"request": make_request(), "retry_count": 0, "warnings": []}
-            )
-        )
-
-
-class InvalidDraftServices(FakeServices):
-    async def generate_plan(
-        self,
-        request: TripRequest,
-        attraction_context: str,
-        weather_context: str,
-        hotel_context: str,
-    ) -> dict[str, Any]:
-        draft = make_valid_draft(request)
-        draft["days"] = draft["days"][:-1]
-        return draft
-
-
-def test_invalid_llm_draft_fails_business_validation() -> None:
-    graph = build_trip_graph(InvalidDraftServices())
-
-    with pytest.raises(TripPlanValidationError, match="应生成 3 天行程"):
-        asyncio.run(
-            graph.ainvoke(
-                {"request": make_request(), "retry_count": 0, "warnings": []}
-            )
-        )
-
-
-class PydanticInvalidDraftServices(FakeServices):
-    async def generate_plan(
-        self,
-        request: TripRequest,
-        attraction_context: str,
-        weather_context: str,
-        hotel_context: str,
-    ) -> dict[str, Any]:
-        draft = make_valid_draft(request)
-        del draft["overall_suggestions"]
-        return draft
-
-
-def test_missing_required_field_fails_pydantic_validation() -> None:
-    graph = build_trip_graph(PydanticInvalidDraftServices())
-
-    with pytest.raises(TripPlanValidationError, match="overall_suggestions"):
-        asyncio.run(
-            graph.ainvoke(
-                {"request": make_request(), "retry_count": 0, "warnings": []}
-            )
-        )
+    assert first["final_plan"].city == "上海"
+    assert second["final_plan"].city == "北京"

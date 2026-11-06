@@ -1,5 +1,12 @@
 import axios from 'axios'
-import type { TripFormData, TripPlanResponse } from '@/types'
+import type {
+  StoredTripPlan,
+  TripFormData,
+  TripJobStarted,
+  TripJobStatus,
+  TripPlanResponse,
+  TripReplanRequest
+} from '@/types'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -48,6 +55,66 @@ export async function generateTripPlan(formData: TripFormData): Promise<TripPlan
   }
 }
 
+/** 提交规划任务，立即返回 job_id。 */
+export async function startTripPlanJob(formData: TripFormData): Promise<TripJobStarted> {
+  try {
+    const response = await apiClient.post<TripJobStarted>('/api/trip/jobs', formData)
+    return response.data
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || error.message || '提交规划任务失败')
+  }
+}
+
+/** 读取后端记录的真实 LangGraph 节点进度。 */
+export async function getTripJob(jobId: string): Promise<TripJobStatus> {
+  const response = await apiClient.get<TripJobStatus>(`/api/trip/jobs/${jobId}`)
+  return response.data
+}
+
+export async function waitForTripJob(
+  jobId: string,
+  onProgress: (status: TripJobStatus) => void,
+  timeoutMs = 120000
+): Promise<TripJobStatus> {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    const status = await getTripJob(jobId)
+    onProgress(status)
+    if (status.status === 'completed') return status
+    if (status.status === 'failed') {
+      throw new Error(status.error || '旅行规划任务失败')
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 800))
+  }
+  throw new Error('查询规划结果超时；后端任务仍可能在继续执行')
+}
+
+/** 按 plan_id 从后端 SQLite 读取，不依赖浏览器缓存。 */
+export async function getStoredTripPlan(planId: string): Promise<StoredTripPlan> {
+  try {
+    const response = await apiClient.get<StoredTripPlan>(`/api/trip/plans/${planId}`)
+    return response.data
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || error.message || '读取旅行计划失败')
+  }
+}
+
+/** 将编辑内容转成约束并创建新修订，不直接篡改结果。 */
+export async function startReplanJob(
+  planId: string,
+  changes: TripReplanRequest
+): Promise<TripJobStarted> {
+  try {
+    const response = await apiClient.post<TripJobStarted>(
+      `/api/trip/plans/${planId}/replan`,
+      changes
+    )
+    return response.data
+  } catch (error: any) {
+    throw new Error(error.response?.data?.detail || error.message || '提交重新规划失败')
+  }
+}
+
 /**
  * 健康检查
  */
@@ -62,4 +129,3 @@ export async function healthCheck(): Promise<any> {
 }
 
 export default apiClient
-

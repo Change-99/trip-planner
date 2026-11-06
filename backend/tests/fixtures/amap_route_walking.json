@@ -1,0 +1,20 @@
+{
+  "status": "1",
+  "info": "OK",
+  "route": {
+    "paths": [
+      {
+        "distance": "1850",
+        "duration": "1560",
+        "steps": [
+          {
+            "instruction": "向东步行300米"
+          },
+          {
+            "instruction": "右转进入测试路"
+          }
+        ]
+      }
+    ]
+  }
+}

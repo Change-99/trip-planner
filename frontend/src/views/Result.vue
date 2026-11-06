@@ -6,13 +6,13 @@
         ← 返回首页
       </a-button>
       <a-space size="middle">
-        <a-button v-if="!editMode" @click="toggleEditMode" type="default">
-          ✏️ 编辑行程
+        <a-button v-if="tripPlan && !editMode" @click="toggleEditMode" type="default">
+          ✏️ 调整并重新规划
         </a-button>
-        <a-button v-else @click="saveChanges" type="primary">
-          💾 保存修改
+        <a-button v-if="editMode" @click="saveChanges" type="primary" :loading="replanning">
+          🧠 重新计算行程
         </a-button>
-        <a-button v-if="editMode" @click="cancelEdit" type="default">
+        <a-button v-if="editMode" @click="cancelEdit" type="default" :disabled="replanning">
           ❌ 取消编辑
         </a-button>
 
@@ -35,7 +35,16 @@
       </a-space>
     </div>
 
-    <div v-if="tripPlan" class="content-wrapper">
+    <div v-if="replanning" class="workflow-progress">
+      <a-progress :percent="replanProgress" status="active" />
+      <div>{{ replanStage }}</div>
+    </div>
+
+    <div v-if="pageLoading" class="page-loading">
+      <a-spin size="large" tip="正在从后端读取已保存的旅行计划..." />
+    </div>
+
+    <div v-else-if="tripPlan" class="content-wrapper">
       <!-- 侧边导航 -->
       <div class="side-nav">
         <a-affix :offset-top="80">
@@ -75,35 +84,59 @@
                   <span class="info-value">{{ tripPlan.start_date }} 至 {{ tripPlan.end_date }}</span>
                 </div>
                 <div class="info-item">
-                  <span class="info-label">💡 建议:</span>
-                  <span class="info-value">{{ tripPlan.overall_suggestions }}</span>
+                  <span class="info-label">✅ 规划说明:</span>
+                  <span class="info-value">{{ tripPlan.planning_summary || tripPlan.overall_suggestions }}</span>
+                </div>
+                <div class="info-item" v-if="tripPlan.travel_advice?.length">
+                  <span class="info-label">💡 旅行建议:</span>
+                  <div class="info-value">
+                    <div v-for="(advice, index) in tripPlan.travel_advice" :key="index" class="advice-item">
+                      <a-tag color="blue">{{ advice.category }}</a-tag>
+                      <span>{{ advice.content }}</span>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="editMode" class="replan-editor">
+                  <a-alert
+                    type="info"
+                    show-icon
+                    message="编辑会创建新修订"
+                    description="删除景点会转换为禁止约束；地址、开放时间、路线和预算会由工具重新查询，不允许直接改写。"
+                  />
+                  <div class="replan-field">
+                    <div class="info-label">本次调整要求：</div>
+                    <a-textarea
+                      v-model:value="replanInstructions"
+                      :rows="3"
+                      placeholder="例如：希望行程更轻松，尽量少换乘，下午留出休息时间"
+                    />
+                  </div>
                 </div>
               </div>
             </a-card>
 
             <!-- 预算明细 -->
             <a-card id="budget" v-if="tripPlan.budget" title="💰 预算明细" :bordered="false" class="budget-card">
-              <div class="budget-grid">
-                <div class="budget-item">
-                  <div class="budget-label">景点门票</div>
-                  <div class="budget-value">¥{{ tripPlan.budget.total_attractions }}</div>
-                </div>
-                <div class="budget-item">
-                  <div class="budget-label">酒店住宿</div>
-                  <div class="budget-value">¥{{ tripPlan.budget.total_hotels }}</div>
-                </div>
-                <div class="budget-item">
-                  <div class="budget-label">餐饮费用</div>
-                  <div class="budget-value">¥{{ tripPlan.budget.total_meals }}</div>
-                </div>
-                <div class="budget-item">
-                  <div class="budget-label">交通费用</div>
-                  <div class="budget-value">¥{{ tripPlan.budget.total_transportation }}</div>
+              <div class="budget-status">
+                <a-tag :color="tripPlan.budget.status === 'verified' ? 'green' : tripPlan.budget.status === 'partial' ? 'orange' : 'default'">
+                  {{ budgetStatusLabel(tripPlan.budget.status) }}
+                </a-tag>
+              </div>
+              <div class="budget-grid" v-if="tripPlan.budget.components?.length">
+                <div class="budget-item" v-for="(component, index) in (tripPlan.budget.components || [])" :key="index">
+                  <div class="budget-label">{{ component.label }}</div>
+                  <div class="budget-value">{{ formatBudgetComponent(component) }}</div>
+                  <a v-if="component.source_urls?.length" :href="component.source_urls[0]" target="_blank" rel="noopener noreferrer">查看来源</a>
                 </div>
               </div>
-              <div class="budget-total">
-                <span class="total-label">预估总费用</span>
-                <span class="total-value">¥{{ tripPlan.budget.total }}</span>
+              <div class="budget-total" v-if="tripPlan.budget.estimated_minimum_yuan != null">
+                <span class="total-label">已取得证据项目的估算范围</span>
+                <span class="total-value">
+                  ¥{{ tripPlan.budget.estimated_minimum_yuan }}–{{ tripPlan.budget.estimated_maximum_yuan }}
+                </span>
+              </div>
+              <div v-if="tripPlan.budget.unknown_items?.length" class="budget-unknown">
+                未计价：{{ tripPlan.budget.unknown_items.join('、') }}
               </div>
             </a-card>
           </div>
@@ -111,7 +144,12 @@
           <!-- 右侧:地图 -->
           <div class="right-map">
             <a-card id="map" title="📍 景点地图" :bordered="false" class="map-card">
-              <div id="amap-container" style="width: 100%; height: 100%"></div>
+              <div v-if="mapError" class="map-error-state">
+                <div class="map-error-icon">🗺️</div>
+                <div class="map-error-title">地图暂时无法加载</div>
+                <div class="map-error-message">{{ mapError }}</div>
+              </div>
+              <div v-show="!mapError" id="amap-container" style="width: 100%; height: 100%"></div>
             </a-card>
           </div>
         </div>
@@ -161,20 +199,6 @@
                         <a-space>
                           <a-button
                             size="small"
-                            @click="moveAttraction(day.day_index, index, 'up')"
-                            :disabled="index === 0"
-                          >
-                            ↑
-                          </a-button>
-                          <a-button
-                            size="small"
-                            @click="moveAttraction(day.day_index, index, 'down')"
-                            :disabled="index === day.attractions.length - 1"
-                          >
-                            ↓
-                          </a-button>
-                          <a-button
-                            size="small"
                             danger
                             @click="deleteAttraction(day.day_index, index)"
                           >
@@ -194,29 +218,17 @@
                         <div class="attraction-badge">
                           <span class="badge-number">{{ index + 1 }}</span>
                         </div>
-                        <div v-if="item.ticket_price" class="price-tag">
-                          ¥{{ item.ticket_price }}
+                        <div v-if="item.ticket_price !== undefined && item.ticket_price !== null" class="price-tag">
+                          {{ item.ticket_price === 0 ? '免费' : `¥${item.ticket_price}` }}
                         </div>
                       </div>
 
-                      <!-- 编辑模式下可编辑的字段 -->
-                      <div v-if="editMode">
-                        <p><strong>地址:</strong></p>
-                        <a-input v-model:value="item.address" size="small" style="margin-bottom: 8px" />
-
-                        <p><strong>游览时长(分钟):</strong></p>
-                        <a-input-number v-model:value="item.visit_duration" :min="10" :max="480" size="small" style="width: 100%; margin-bottom: 8px" />
-
-                        <p><strong>描述:</strong></p>
-                        <a-textarea v-model:value="item.description" :rows="2" size="small" style="margin-bottom: 8px" />
-                      </div>
-
-                      <!-- 查看模式 -->
-                      <div v-else>
+                      <div>
                         <p><strong>地址:</strong> {{ item.address }}</p>
                         <p><strong>游览时长:</strong> {{ item.visit_duration }}分钟</p>
                         <p><strong>描述:</strong> {{ item.description }}</p>
                         <p v-if="item.rating"><strong>评分:</strong> {{ item.rating }}⭐</p>
+                        <a-tag v-if="editMode" color="orange">外部证据字段，重新规划时更新</a-tag>
                       </div>
                     </a-card>
                   </a-list-item>
@@ -309,32 +321,49 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
-import type { TripPlan } from '@/types'
+import { getStoredTripPlan, startReplanJob, waitForTripJob } from '@/services/api'
+import type { BudgetComponent, TripPlan } from '@/types'
 
+const route = useRoute()
 const router = useRouter()
 const tripPlan = ref<TripPlan | null>(null)
+const planId = ref('')
+const pageLoading = ref(true)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
+const replanInstructions = ref('')
+const replanning = ref(false)
+const replanProgress = ref(0)
+const replanStage = ref('')
 const attractionPhotos = ref<Record<string, string>>({})
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
+const mapError = ref('')
 let map: any = null
 
 onMounted(async () => {
-  const data = sessionStorage.getItem('tripPlan')
-  if (data) {
-    tripPlan.value = JSON.parse(data)
-    // 加载景点图片
-    await loadAttractionPhotos()
-    // 等待DOM渲染完成后初始化地图
+  planId.value = String(route.params.planId || '')
+  if (!planId.value) {
+    pageLoading.value = false
+    return
+  }
+  try {
+    const stored = await getStoredTripPlan(planId.value)
+    tripPlan.value = stored.data
+    // 地图不应被图片服务阻塞，两项任务各自独立执行。
     await nextTick()
-    initMap()
+    void initMap()
+    void loadAttractionPhotos()
+  } catch (error: any) {
+    message.error(error.message || '读取旅行计划失败')
+  } finally {
+    pageLoading.value = false
   }
 })
 
@@ -354,27 +383,61 @@ const scrollToSection = ({ key }: { key: string }) => {
 // 切换编辑模式
 const toggleEditMode = () => {
   editMode.value = true
+  replanInstructions.value = ''
   // 保存原始数据用于取消编辑
   originalPlan.value = JSON.parse(JSON.stringify(tripPlan.value))
   message.info('进入编辑模式')
 }
 
-// 保存修改
-const saveChanges = () => {
-  editMode.value = false
-  // 更新sessionStorage
-  if (tripPlan.value) {
-    sessionStorage.setItem('tripPlan', JSON.stringify(tripPlan.value))
-  }
-  message.success('修改已保存')
+// 把删除的景点转为禁止约束，完整重跑 LangGraph。
+const saveChanges = async () => {
+  if (!tripPlan.value || !originalPlan.value || !planId.value) return
+  const currentNames = new Set(
+    tripPlan.value.days.flatMap(day => day.attractions.map(item => item.name))
+  )
+  const removedNames = originalPlan.value.days
+    .flatMap(day => day.attractions.map(item => item.name))
+    .filter(name => !currentNames.has(name))
 
-  // 重新初始化地图以反映更改
-  if (map) {
-    map.destroy()
+  if (!removedNames.length && !replanInstructions.value.trim()) {
+    message.warning('请删除不想去的景点，或填写本次调整要求')
+    return
   }
-  nextTick(() => {
-    initMap()
-  })
+
+  replanning.value = true
+  replanProgress.value = 0
+  replanStage.value = '正在提交新修订...'
+  try {
+    const job = await startReplanJob(planId.value, {
+      forbidden_places: removedNames,
+      additional_requirements: replanInstructions.value.trim()
+    })
+    const completed = await waitForTripJob(job.job_id, status => {
+      replanProgress.value = status.progress
+      replanStage.value = status.stage
+    })
+    if (!completed.plan_id) throw new Error('重新规划未返回 plan_id')
+
+    const stored = await getStoredTripPlan(completed.plan_id)
+    planId.value = completed.plan_id
+    tripPlan.value = stored.data
+    originalPlan.value = null
+    editMode.value = false
+    replanInstructions.value = ''
+    await router.replace(`/result/${completed.plan_id}`)
+    if (map) map.destroy()
+    await nextTick()
+    void initMap()
+    void loadAttractionPhotos()
+    message.success(`新行程已重新计算并保存为第 ${stored.revision} 版`)
+  } catch (error: any) {
+    if (originalPlan.value) {
+      tripPlan.value = JSON.parse(JSON.stringify(originalPlan.value))
+    }
+    message.error(error.message || '重新规划失败')
+  } finally {
+    replanning.value = false
+  }
 }
 
 // 取消编辑
@@ -383,6 +446,7 @@ const cancelEdit = () => {
     tripPlan.value = JSON.parse(JSON.stringify(originalPlan.value))
   }
   editMode.value = false
+  replanInstructions.value = ''
   message.info('已取消编辑')
 }
 
@@ -400,20 +464,6 @@ const deleteAttraction = (dayIndex: number, attrIndex: number) => {
   message.success('景点已删除')
 }
 
-// 移动景点顺序
-const moveAttraction = (dayIndex: number, attrIndex: number, direction: 'up' | 'down') => {
-  if (!tripPlan.value) return
-
-  const day = tripPlan.value.days[dayIndex]
-  const attractions = day.attractions
-
-  if (direction === 'up' && attrIndex > 0) {
-    [attractions[attrIndex], attractions[attrIndex - 1]] = [attractions[attrIndex - 1], attractions[attrIndex]]
-  } else if (direction === 'down' && attrIndex < attractions.length - 1) {
-    [attractions[attrIndex], attractions[attrIndex + 1]] = [attractions[attrIndex + 1], attractions[attrIndex]]
-  }
-}
-
 const getMealLabel = (type: string): string => {
   const labels: Record<string, string> = {
     breakfast: '早餐',
@@ -422,6 +472,27 @@ const getMealLabel = (type: string): string => {
     snack: '小吃'
   }
   return labels[type] || type
+}
+
+const budgetStatusLabel = (status: string): string => {
+  return {
+    verified: '价格已核实',
+    partial: '部分预算',
+    unavailable: '暂无可靠价格'
+  }[status] || status
+}
+
+const formatBudgetComponent = (component: BudgetComponent): string => {
+  if (component.confirmed_yuan !== undefined && component.confirmed_yuan !== null) {
+    return component.confirmed_yuan === 0 ? '免费' : `¥${component.confirmed_yuan}`
+  }
+  if (component.minimum_yuan !== undefined && component.minimum_yuan !== null) {
+    const maximum = component.maximum_yuan ?? component.minimum_yuan
+    return maximum === component.minimum_yuan
+      ? `参考 ¥${component.minimum_yuan}`
+      : `参考 ¥${component.minimum_yuan}–${maximum}`
+  }
+  return '价格未核实'
 }
 
 // 加载所有景点图片
@@ -788,9 +859,26 @@ const exportAsPDF = async () => {
 
 // 初始化地图
 const initMap = async () => {
+  mapError.value = ''
   try {
+    const jsApiKey = import.meta.env.VITE_AMAP_WEB_JS_KEY
+    const securityJsCode = import.meta.env.VITE_AMAP_SECURITY_JS_CODE
+    if (!jsApiKey || jsApiKey.includes('your_')) {
+      throw new Error('缺少 VITE_AMAP_WEB_JS_KEY，请检查 frontend/.env')
+    }
+    if (!securityJsCode || securityJsCode.includes('your_')) {
+      throw new Error(
+        '缺少高德 securityJsCode，请在 frontend/.env 配置 VITE_AMAP_SECURITY_JS_CODE 后重启前端'
+      )
+    }
+
+    // 必须在 AMapLoader.load 之前配置安全密钥。
+    const amapWindow = window as any
+    amapWindow._AMapSecurityConfig = {
+      securityJsCode
+    }
     const AMap = await AMapLoader.load({
-      key: import.meta.env.VITE_AMAP_WEB_JS_KEY,  // 高德地图Web端(JS API) Key
+      key: jsApiKey,
       version: '2.0',
       plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow']
     })
@@ -806,9 +894,11 @@ const initMap = async () => {
     addAttractionMarkers(AMap)
 
     message.success('地图加载成功')
-  } catch (error) {
+  } catch (error: any) {
     console.error('地图加载失败:', error)
-    message.error('地图加载失败')
+    const detail = error?.message || '请检查高德 JS API Key、安全密钥和域名白名单'
+    mapError.value = detail
+    message.error(`地图加载失败：${detail}`)
   }
 }
 
@@ -932,6 +1022,32 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
 .back-button {
   border-radius: 8px;
   font-weight: 500;
+}
+
+.workflow-progress,
+.page-loading {
+  max-width: 900px;
+  margin: 0 auto 24px;
+  padding: 22px 28px;
+  text-align: center;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.page-loading {
+  min-height: 180px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.replan-editor {
+  margin-top: 18px;
+}
+
+.replan-field {
+  margin-top: 14px;
 }
 
 /* 内容布局 */
@@ -1160,9 +1276,29 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
   line-height: 1.6;
 }
 
+.advice-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
 /* 预算卡片 */
 .budget-card {
   height: fit-content;
+}
+
+.budget-status {
+  margin-bottom: 12px;
+}
+
+.budget-unknown {
+  margin-top: 12px;
+  padding: 10px 12px;
+  color: #8c6d1f;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 6px;
 }
 
 .budget-grid {
@@ -1221,6 +1357,37 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
 .map-card :deep(.ant-card-body) {
   height: calc(100% - 57px);
   padding: 0;
+}
+
+.map-error-state {
+  height: 100%;
+  min-height: 440px;
+  padding: 40px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: #666;
+  background: #fafafa;
+}
+
+.map-error-icon {
+  margin-bottom: 16px;
+  font-size: 48px;
+}
+
+.map-error-title {
+  margin-bottom: 10px;
+  font-size: 18px;
+  font-weight: 600;
+  color: #333;
+}
+
+.map-error-message {
+  max-width: 420px;
+  line-height: 1.7;
+  word-break: break-word;
 }
 
 /* 每日行程卡片 */
@@ -1388,4 +1555,3 @@ const drawRoutes = (AMap: any, attractions: any[]) => {
   }
 }
 </style>
-
